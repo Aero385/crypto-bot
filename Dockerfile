@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 COPY config.yaml ./
 
-# Журнал алертов — в volume
-VOLUME ["/app/data"]
+# Папка для данных
+RUN mkdir -p /app/data
 ENV DB_PATH=/app/data/alerts.db
 
 # Рестарт при падении (на уровне docker-compose/systemd лучше, но и так сгодится)
