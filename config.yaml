@@ -1,0 +1,238 @@
+# ============================================
+# CRYPTO ALERT BOT v2 — СКАЛЬПИНГ, ТОП-500
+# ============================================
+# Философия: сигналы НЕ шлются по одному.
+# Они копятся в буфере, и алерт идёт когда совпадают несколько.
+# Это фильтрует 90% шума автоматически.
+
+telegram:
+  bot_token: ""
+  # ID канала/группы куда слать алерты (начинается с -100 для каналов)
+  chat_id: ""
+
+# ==== ОБЩИЕ ПАРАМЕТРЫ ====
+scan_interval_seconds: 30    # для скальпинга — 30с. Для свинга ставь 120.
+universe_refresh_minutes: 60 # как часто обновлять список монет
+
+# ==== ДВА ПОТОКА МОНИТОРИНГА ====
+# Поток 1 ("core") — рабочие лошади. Ликвидные монеты для реальной торговли.
+#   Все 8 детекторов, confluence, точки входа.
+# Поток 2 ("radar") — радар для гемов. Микро/мидкапы, ищем только экстремальные
+#   аномалии (объём x10+, цена 20%+). Торговать осторожно, но поймать можно много.
+
+streams:
+  core:
+    enabled: true
+    top_n_coins: 200
+    min_market_cap_usd: 100000000     # 100M — только ликвидные
+    min_volume_24h_usd: 15000000      # 15M
+    min_age_days: 30
+    # Все детекторы, confluence как в основном конфиге
+    # Точки входа включены
+    scan_interval_seconds: 30
+    confluence_tiers:
+      watch: 2.0
+      signal: 4.0
+      strong: 6.5
+    min_detector_count:
+      watch: 1
+      signal: 2
+      strong: 3
+    label: "💎"      # префикс в алертах
+
+  radar:
+    enabled: true
+    top_n_coins: 1500
+    min_market_cap_usd: 5000000       # 5M — берём мелкие, но не совсем пыль
+    max_market_cap_usd: 200000000     # 200M — чтоб не дублировать core
+    min_volume_24h_usd: 1000000       # 1M — минимум для хоть какой-то торговли
+    min_age_days: 7                   # свежие тоже интересны
+    # Только самые грубые детекторы — объём и цена
+    # Стакан, OI, funding — НЕ проверяем (слишком много монет, убьём API)
+    detectors_enabled: ["volume_spike", "price_move_atr", "breakout"]
+    scan_interval_seconds: 120        # раз в 2 мин — реже чем core
+    # ВЫСОКИЕ пороги — чтобы не спамило
+    volume_spike_min_multiplier: 10   # только x10+
+    price_move_min_atr: 3.0           # только 3+ ATR
+    confluence_tiers:
+      watch: 3.0                      # выше чем core — фильтруем сильнее
+      signal: 5.0
+      strong: 8.0
+    min_detector_count:
+      watch: 1
+      signal: 2
+      strong: 2
+    label: "🔭"      # префикс "радар" в алертах
+    # Точки входа ВЫКЛЮЧЕНЫ — радар только для наблюдения
+    entry_signals_enabled: false
+
+# Общие фильтры для обоих потоков
+filters:
+  blacklist: ["USDT","USDC","DAI","TUSD","BUSD","FDUSD","USDD","PYUSD","USDE","USD1"]
+  whitelist: []                     # если заполнить — работать ТОЛЬКО с этими
+
+# ==== ДЕТЕКТОРЫ (каждый выдаёт сигнал с весом) ====
+# Вес (weight) = вклад в итоговый score. Чем выше, тем сильнее сигнал.
+
+detectors:
+  # --- 1. Всплеск объёма ---
+  volume_spike:
+    enabled: true
+    # Сравниваем с тем же часом в другие дни недели (а не просто среднее)
+    baseline_mode: "hour_of_week"  # альтернатива: "rolling_24h"
+    baseline_days: 14              # за сколько дней строить baseline
+    tiers:
+      # multiplier → weight
+      x5: 1.0    # объём x5 от обычного — слабый сигнал (+1 к score)
+      x7: 2.0    # x7 — средний (+2)
+      x10: 3.5   # x10 — сильный (+3.5)
+
+  # --- 2. Движение цены в единицах ATR ---
+  # ATR = Average True Range — показывает "нормальную" волатильность монеты.
+  # Движение в 2 ATR означает: монета двинулась в 2 раза сильнее обычного.
+  price_move_atr:
+    enabled: true
+    atr_period_minutes: 60         # за какое окно считать ATR
+    atr_lookback_hours: 24         # за какой период сглаживать ATR
+    tiers:
+      atr_1_5: 1.0   # 1.5 ATR — необычно
+      atr_2_0: 2.0   # 2 ATR — сильно
+      atr_3_0: 3.5   # 3 ATR — экстремально
+
+  # --- 3. Пробой локальных хаёв/лоёв ---
+  breakout:
+    enabled: true
+    # Считаем high/low за N часов назад
+    lookback_hours: [4, 24, 168]  # 4ч, сутки, неделя
+    # Нужно ли подтверждение объёмом (объём > среднего при пробое)?
+    require_volume_confirmation: true
+    # Вес пробоя за разные периоды
+    weights:
+      "4": 1.0
+      "24": 2.0
+      "168": 3.5
+
+  # --- 4. Аномалии в стакане (только Binance) ---
+  orderbook:
+    enabled: true
+    depth_levels: 100             # сколько уровней стакана смотреть
+    tiers:
+      # размер стены в $ → вес
+      wall_500k: 1.0
+      wall_1m: 2.0
+      wall_3m: 3.5
+    imbalance:
+      threshold_ratio: 3.0        # bid/ask соотношение для алерта
+      weight: 1.5
+
+  # --- 5. Open Interest (ФЬЮЧЕРСЫ!) ---
+  # Рост OI + рост цены = в рынок заходят новые деньги (сильный тренд)
+  # Рост OI + падение цены = шортисты открывают шорты
+  # Падение OI + рост цены = закрываются шорты (слабее, может быстро развернуться)
+  open_interest:
+    enabled: true
+    change_window_minutes: 15      # за сколько времени смотреть изменение
+    tiers:
+      # % изменения OI за окно → вес
+      pct_3: 1.0
+      pct_5: 2.0
+      pct_10: 3.5
+
+  # --- 6. Funding rate (ФЬЮЧЕРСЫ!) ---
+  # Экстремально высокий funding → перекос в лонги → риск каскада шортов
+  # Экстремально низкий (отрицательный) → перекос в шорты → риск шорт-сквиза
+  funding:
+    enabled: true
+    # Funding обычно ±0.01%. Всё что выше по модулю — уже перекос.
+    thresholds:
+      extreme: 0.1    # ±0.1% — очень сильно
+      high: 0.05      # ±0.05% — заметно
+    weights:
+      extreme: 3.0
+      high: 1.5
+
+  # --- 7. Крупные ликвидации ---
+  liquidations:
+    enabled: true
+    aggregate_window_minutes: 5
+    tiers:
+      # сумма ликвидаций за окно в $ → вес
+      usd_1m: 1.0
+      usd_5m: 2.5
+      usd_10m: 3.5
+
+  # --- 8. On-chain netflow (только для монет с адресами бирж) ---
+  # Работает для ETH и ERC-20. Нужен бесплатный Etherscan API key.
+  netflow:
+    enabled: true
+    etherscan_api_key: "ВСТАВЬ_СЮДА_ETHERSCAN_API_KEY"  # https://etherscan.io/myapikey
+    # Переводы больше этой суммы в $ считаем крупными
+    min_transfer_usd: 500000
+    window_minutes: 30
+    # Нетто-приток на биржу = давление продажи (bearish)
+    # Нетто-отток с биржи = накопление (bullish)
+    weights:
+      inflow_bearish: 1.5    # деньги пошли на биржу
+      outflow_bullish: 2.0   # деньги ушли с биржи (сильнее — киты забирают холды)
+
+  # --- 9. Импульс (PUMP/DUMP за 15-30 мин) ---
+  # Ловит резкие движения на 5-мин свечах. Быстрее чем price_move_atr.
+  impulse:
+    enabled: true
+    tiers:
+      pct_5: 2.0    # 5%+ за 15-30 мин
+      pct_8: 3.0    # 8%+
+      pct_15: 4.0   # 15%+ — экстремальный pump/dump
+
+# ==== CONFLUENCE ENGINE ====
+confluence:
+  # Окно, в котором копятся сигналы перед решением
+  window_minutes: 15
+  # Пороги суммарного score для разных уровней алертов
+  tiers:
+    watch: 2.0       # 👀 просто к сведению
+    signal: 4.0      # ⚡ торговый сигнал
+    strong: 6.5      # 🚨 сильная конвергенция
+  # Минимум РАЗНЫХ детекторов для алерта
+  # Это защита от случая: "объём x10" и сам по себе даёт score 3.5,
+  # но без подтверждения с других детекторов — это ещё не торговый сигнал
+  min_detector_count:
+    watch: 1
+    signal: 2
+    strong: 3
+
+# ==== АНТИ-СПАМ ====
+cooldown:
+  # По одной монете не чаще раз в N минут
+  watch_minutes: 15
+  signal_minutes: 30
+  strong_minutes: 60
+
+# ==== ТИХИЕ ЧАСЫ ====
+quiet_hours:
+  enabled: false
+  start_hour_utc: 22
+  end_hour_utc: 6
+  # Важно: strong-алерты игнорируют quiet hours (настоящие киты не ждут)
+  override_for_strong: true
+
+# ==== БИРЖИ ====
+exchanges:
+  # Из какой биржи брать данные для детекторов
+  primary: "binance"       # binance | bybit
+  # Fallback если primary не отдаёт данные по монете
+  fallback: "bybit"
+
+# ==== РИСК-МЕНЕДЖМЕНТ (для модуля точек входа) ====
+risk_management:
+  # % от депозита на 1 сделку. 1% = стандарт. 0.5% = консервативно.
+  risk_per_trade_pct: 1.0
+  # Макс размер позиции (% от депозита)
+  max_position_pct: 10.0
+  # Минимальный R:R. Ниже этого — не отправляем сигнал.
+  min_risk_reward: 1.5
+  # Включить точки входа?
+  entry_signals_enabled: true
+  # Мин score и детекторов для точки входа
+  min_score_for_entry: 5.0
+  min_detectors_for_entry: 2

@@ -1,0 +1,24 @@
+services:
+  bot:
+    build: .
+    container_name: crypto-alert-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    # Ресурсы — для VPS с 1GB RAM хватит с запасом
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Опционально: ежедневный отчёт в cron-контейнере
+  reporter:
+    build: .
+    container_name: crypto-alert-reporter
+    restart: "no"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    command: python -u report.py
+    profiles: ["manual"]  # запускается только через `docker compose run reporter`

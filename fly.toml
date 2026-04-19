@@ -1,0 +1,15 @@
+app = "crypto-alert-bot"
+primary_region = "ams"
+
+[build]
+
+[env]
+  # Переменные окружения задаются через: fly secrets set KEY=VALUE
+
+[processes]
+  bot = "python -u main.py"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["bot"]
