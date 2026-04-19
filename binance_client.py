@@ -11,9 +11,15 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
-SPOT_URL = "https://api.binance.com"
-FUTURES_URL = "https://fapi.binance.com"
-
+SPOT_URLS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+FUTURES_URLS = [
+    "https://fapi.binance.com",
+]
 
 class BinanceClient:
     """Работа с Binance Spot + Futures через публичные API."""
@@ -24,6 +30,9 @@ class BinanceClient:
         self._futures_symbols: Optional[set] = None
         self._spot_symbols_ts: float = 0
         self._futures_symbols_ts: float = 0
+        # Рабочие URL (определяются при старте)
+        self.spot_url: str = SPOT_URLS[0]
+        self.futures_url: str = FUTURES_URLS[0]
         # Кэш klines: (symbol, interval, limit) → (timestamp, data)
         self._klines_cache: Dict[tuple, tuple] = {}
         self._klines_cache_ttl: int = 45  # секунд
@@ -32,6 +41,42 @@ class BinanceClient:
         self.api_calls: int = 0
         self.api_errors: int = 0
         self._api_calls_reset: float = time.time()
+        self._error_logged: bool = False  # чтобы не спамить одну и ту же ошибку
+
+    def health_check(self) -> bool:
+        """Проверка доступности API при старте. Пробует разные домены."""
+        # Spot
+        for url in SPOT_URLS:
+            try:
+                r = self.session.get(f"{url}/api/v3/ping", timeout=5)
+                if r.status_code == 200:
+                    self.spot_url = url
+                    log.info("✅ Binance Spot OK: %s", url)
+                    break
+                else:
+                    log.warning("❌ Binance Spot %s → HTTP %s: %s", url, r.status_code, r.text[:200])
+            except Exception as e:
+                log.warning("❌ Binance Spot %s → %s", url, e)
+        else:
+            log.error("❌ Binance Spot недоступен ни через один домен!")
+            return False
+
+        # Futures
+        for url in FUTURES_URLS:
+            try:
+                r = self.session.get(f"{url}/fapi/v1/ping", timeout=5)
+                if r.status_code == 200:
+                    self.futures_url = url
+                    log.info("✅ Binance Futures OK: %s", url)
+                    break
+                else:
+                    log.warning("❌ Binance Futures %s → HTTP %s: %s", url, r.status_code, r.text[:200])
+            except Exception as e:
+                log.warning("❌ Binance Futures %s → %s", url, e)
+        else:
+            log.warning("⚠️ Binance Futures недоступен — бот будет работать только со Spot данными")
+
+        return True
 
     def get_api_stats(self) -> Dict:
         """Статистика API-вызовов с момента последнего сброса."""
@@ -58,11 +103,15 @@ class BinanceClient:
                     self.api_errors += 1
                     time.sleep(2 ** attempt)
                     continue
-                log.debug("Binance %s → %s", url, r.status_code)
+                if not self._error_logged:
+                    log.warning("Binance HTTP %s: %s → %s", r.status_code, url.split("/")[-1], r.text[:150])
+                    self._error_logged = True
                 self.api_errors += 1
                 return None
             except Exception as e:
-                log.debug("Binance request error: %s", e)
+                if not self._error_logged:
+                    log.warning("Binance connection error: %s", e)
+                    self._error_logged = True
                 self.api_errors += 1
                 time.sleep(0.5)
         return None
@@ -70,7 +119,7 @@ class BinanceClient:
     # -------- Список торгуемых пар (обновляется раз в 30 мин) --------
     def spot_symbols(self) -> set:
         if self._spot_symbols is None or (time.time() - self._spot_symbols_ts > 1800):
-            data = self._get(f"{SPOT_URL}/api/v3/exchangeInfo")
+            data = self._get(f"{self.spot_url}/api/v3/exchangeInfo")
             if data:
                 self._spot_symbols = {
                     s["symbol"] for s in data["symbols"]
@@ -83,7 +132,7 @@ class BinanceClient:
 
     def futures_symbols(self) -> set:
         if self._futures_symbols is None or (time.time() - self._futures_symbols_ts > 1800):
-            data = self._get(f"{FUTURES_URL}/fapi/v1/exchangeInfo")
+            data = self._get(f"{self.futures_url}/fapi/v1/exchangeInfo")
             if data:
                 self._futures_symbols = {
                     s["symbol"] for s in data["symbols"]
@@ -113,7 +162,7 @@ class BinanceClient:
             if cached and (now - cached[0]) < self._klines_cache_ttl:
                 return cached[1]
 
-        url = f"{FUTURES_URL}/fapi/v1/klines" if futures else f"{SPOT_URL}/api/v3/klines"
+        url = f"{self.futures_url}/fapi/v1/klines" if futures else f"{self.spot_url}/api/v3/klines"
         data = self._get(url, {"symbol": symbol, "interval": interval, "limit": limit})
         if not data:
             return None
@@ -145,13 +194,13 @@ class BinanceClient:
 
     # -------- Стакан --------
     def order_book(self, symbol: str, limit: int = 100) -> Optional[Dict]:
-        return self._get(f"{SPOT_URL}/api/v3/depth",
+        return self._get(f"{self.spot_url}/api/v3/depth",
                         {"symbol": symbol, "limit": limit})
 
     # -------- Open Interest --------
     def open_interest(self, symbol: str) -> Optional[float]:
         """Текущий OI в контрактах (для USDT-перпетуалов это сумма монет)."""
-        data = self._get(f"{FUTURES_URL}/fapi/v1/openInterest", {"symbol": symbol})
+        data = self._get(f"{self.futures_url}/fapi/v1/openInterest", {"symbol": symbol})
         if not data:
             return None
         return float(data.get("openInterest", 0))
@@ -162,7 +211,7 @@ class BinanceClient:
         История OI. period: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d.
         Возвращает: [{timestamp, open_interest, open_interest_value_usd}, ...]
         """
-        data = self._get(f"{FUTURES_URL}/futures/data/openInterestHist", {
+        data = self._get(f"{self.futures_url}/futures/data/openInterestHist", {
             "symbol": symbol, "period": period, "limit": limit,
         })
         if not data:
@@ -179,14 +228,14 @@ class BinanceClient:
     # -------- Funding Rate --------
     def funding_rate(self, symbol: str) -> Optional[float]:
         """Текущий funding rate (обычно обновляется каждые 8 часов)."""
-        data = self._get(f"{FUTURES_URL}/fapi/v1/premiumIndex", {"symbol": symbol})
+        data = self._get(f"{self.futures_url}/fapi/v1/premiumIndex", {"symbol": symbol})
         if not data:
             return None
         return float(data.get("lastFundingRate", 0)) * 100  # в процентах
 
     def all_funding_rates(self) -> Optional[Dict[str, float]]:
         """Funding для всех пар одним запросом — эффективнее."""
-        data = self._get(f"{FUTURES_URL}/fapi/v1/premiumIndex")
+        data = self._get(f"{self.futures_url}/fapi/v1/premiumIndex")
         if not data:
             return None
         return {
@@ -207,6 +256,6 @@ class BinanceClient:
 
     # -------- 24h статистика --------
     def ticker_24h(self, symbol: str, futures: bool = False) -> Optional[Dict]:
-        url = (f"{FUTURES_URL}/fapi/v1/ticker/24hr" if futures
-               else f"{SPOT_URL}/api/v3/ticker/24hr")
+        url = (f"{self.futures_url}/fapi/v1/ticker/24hr" if futures
+               else f"{self.spot_url}/api/v3/ticker/24hr")
         return self._get(url, {"symbol": symbol})

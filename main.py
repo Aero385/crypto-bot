@@ -103,6 +103,7 @@ class AlertBotV2:
         self.notifier = TelegramNotifier(tg["bot_token"], tg["chat_id"])
         self.cg = CoinGeckoClient()
         self.binance = BinanceClient()
+        self.binance.health_check()
         self.liquidations = LiquidationTracker(window_minutes=self.cfg["detectors"]["liquidations"].get("aggregate_window_minutes",5))
         self.netflow_client = EtherscanNetflow(
             api_key=self.cfg["detectors"]["netflow"].get("etherscan_api_key",""),
