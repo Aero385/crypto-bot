@@ -95,6 +95,14 @@ class LiquidationTracker:
     def stop(self):
         self._stop = True
 
+    def cleanup(self, active_symbols: set) -> int:
+        """Remove buffers for symbols no longer tracked. Returns freed count."""
+        with self._lock:
+            stale = [s for s in self._buffers if s not in active_symbols]
+            for s in stale:
+                del self._buffers[s]
+        return len(stale)
+
     # -------- Запросы агрегатов --------
     def get_stats(self, symbol: str) -> Dict:
         """

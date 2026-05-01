@@ -183,12 +183,18 @@ class BinanceClient:
 
         with self._cache_lock:
             self._klines_cache[cache_key] = (now, result)
-            # Чистим устаревшие записи (раз в ~100 вызовов чтобы не копилось)
-            if len(self._klines_cache) > 500:
+            # Агрессивная очистка — Railway has limited memory
+            if len(self._klines_cache) > 200:
                 expired = [k for k, v in self._klines_cache.items()
                            if now - v[0] > self._klines_cache_ttl]
                 for k in expired:
                     del self._klines_cache[k]
+                # Если после очистки expired всё ещё > 300 — удаляем самые старые
+                if len(self._klines_cache) > 300:
+                    by_age = sorted(self._klines_cache.items(), key=lambda x: x[1][0])
+                    to_remove = len(self._klines_cache) - 200
+                    for k, _ in by_age[:to_remove]:
+                        del self._klines_cache[k]
 
         return result
 

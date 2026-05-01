@@ -38,6 +38,13 @@ class VolumeSpikeDetector:
         self.cfg = config["detectors"]["volume_spike"]
         self.baselines: Dict[str, HourOfWeekBaseline] = {}
 
+    def cleanup(self, active_coins: set) -> int:
+        """Remove baselines for coins no longer in universe. Returns freed count."""
+        stale = [c for c in self.baselines if c not in active_coins]
+        for c in stale:
+            del self.baselines[c]
+        return len(stale)
+
     def update(self, coin: str, klines: list) -> Optional[Signal]:
         if not self.cfg["enabled"] or not klines or len(klines) < 2:
             return None
@@ -197,6 +204,13 @@ class OpenInterestDetector:
         self.cfg = config["detectors"]["open_interest"]
         # coin → RollingBuffer[(timestamp, oi_usd)]
         self._history: Dict[str, RollingBuffer] = {}
+
+    def cleanup(self, active_coins: set) -> int:
+        """Remove history for coins no longer in universe. Returns freed count."""
+        stale = [c for c in self._history if c not in active_coins]
+        for c in stale:
+            del self._history[c]
+        return len(stale)
 
     def update(self, coin: str, current_oi_usd: float,
                price_change_pct: float) -> Optional[Signal]:

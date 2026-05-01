@@ -3,7 +3,7 @@ Crypto Alert Bot v2.
 Поддерживает config.yaml (локально) и переменные окружения (Railway/Docker).
 Запуск: python3 main.py
 """
-import os, time, yaml, logging, signal as sys_signal, threading
+import os, time, yaml, logging, signal as sys_signal, threading, gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from notifier import TelegramNotifier
@@ -23,6 +23,23 @@ from entry_signals import EntrySignalGenerator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bot")
+
+def _get_memory_mb() -> float:
+    """Get current RSS memory usage in MB (Linux/Docker)."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    try:
+        import resource
+        # macOS reports in bytes, Linux in KB
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return ru / 1024 / 1024 if os.uname().sysname == 'Darwin' else ru / 1024
+    except Exception:
+        return 0
 
 def load_config(path="config.yaml"):
     env_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -62,7 +79,7 @@ def _defaults(c):
                 "min_detector_count": {"watch":1,"signal":2,"strong":3},
             },
             "radar": {
-                "enabled": True, "top_n_coins": 1500,
+                "enabled": True, "top_n_coins": 500,
                 "min_market_cap_usd": 5000000, "max_market_cap_usd": 200000000,
                 "min_volume_24h_usd": 1000000, "min_age_days": 7,
                 "detectors_enabled": ["volume_spike","price_move_atr","breakout"],
@@ -137,9 +154,10 @@ class AlertBotV2:
                       "last_core_count": 0, "last_radar_count": 0,
                       "total_cycles": 0, "last_cycle_time": 0}
         # ThreadPool для параллельной обработки
-        self._pool = ThreadPoolExecutor(max_workers=8)
+        self._pool = ThreadPoolExecutor(max_workers=4)
         # Lock для engine (add_signal вызывается из разных потоков)
         self._engine_lock = threading.Lock()
+        self._last_cleanup = 0
 
     def _refresh_universe(self):
         interval = self.cfg["universe_refresh_minutes"] * 60
@@ -263,6 +281,30 @@ class AlertBotV2:
             if sym in usyms and (p := usyms[sym].get("current_price", 0)) > 0:
                 self.netflow_client.check_token(sym, contract, dec, p)
         self._last_netflow_check = time.time()
+
+    def _cleanup_memory(self):
+        """Periodic cleanup of stale data to prevent memory leaks."""
+        if time.time() - self._last_cleanup < 600:  # every 10 min
+            return
+        active_coins = {c["symbol"].upper() for c in self._universe}
+        active_pairs = {self.binance.make_pair(s) for s in active_coins}
+        freed = 0
+        freed += self.det_volume.cleanup(active_coins)
+        freed += self.det_oi.cleanup(active_coins)
+        freed += self.liquidations.cleanup(active_pairs)
+        # Clear klines cache for symbols not in universe
+        with self.binance._cache_lock:
+            stale = [k for k in self.binance._klines_cache
+                     if k[0] not in active_pairs]
+            for k in stale:
+                del self.binance._klines_cache[k]
+            freed += len(stale)
+        gc.collect()
+        mem = _get_memory_mb()
+        self._last_cleanup = time.time()
+        if freed > 0 or mem > 0:
+            log.info("🧹 Cleanup: %d stale entries freed | RAM: %.0f MB | cache: %d",
+                     freed, mem, len(self.binance._klines_cache))
 
     def _build_market_context(self, coin: str) -> str:
         """Собрать рыночный контекст для алерта: цена, 24h, funding."""
@@ -395,7 +437,7 @@ class AlertBotV2:
             f"🔭 Radar: топ-{radar_cfg.get('top_n_coins',1500)} (mcap $5M-200M)\n"
             f"Окно: {self.cfg['confluence']['window_minutes']}мин\n"
             f"📍 Точки входа: {entry_status}\n"
-            "⚡ Параллельная обработка: 8 потоков\n"
+            "⚡ Параллельная обработка: 4 потока\n"
             "Алерты через ~30 мин | /help для команд")
 
         cycle = 0
@@ -429,13 +471,15 @@ class AlertBotV2:
                     log.info("🔭 Radar: %d монет за %.1fс", count, elapsed)
 
                 self._dispatch_alerts()
+                self._cleanup_memory()
 
                 cycle_time = time.time() - cycle_start
                 self._perf["total_cycles"] = cycle
                 self._perf["last_cycle_time"] = cycle_time
                 api = self.binance.get_api_stats()
-                log.info("⏱ Цикл %d: %.1fс | API: %d вызовов (%d err)",
-                        cycle, cycle_time, api["calls"], api["errors"])
+                mem = _get_memory_mb()
+                log.info("⏱ Цикл %d: %.1fс | API: %d вызовов (%d err) | RAM: %.0f MB",
+                        cycle, cycle_time, api["calls"], api["errors"], mem)
 
             except Exception as e: log.exception("Ошибка: %s", e)
 
