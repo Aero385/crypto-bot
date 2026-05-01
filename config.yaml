@@ -41,7 +41,7 @@ streams:
 
   radar:
     enabled: true
-    top_n_coins: 500                   # 500 — оптимально для Railway (512MB RAM)
+    top_n_coins: 1500
     min_market_cap_usd: 5000000       # 5M — берём мелкие, но не совсем пыль
     max_market_cap_usd: 200000000     # 200M — чтоб не дублировать core
     min_volume_24h_usd: 1000000       # 1M — минимум для хоть какой-то торговли

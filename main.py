@@ -11,7 +11,7 @@ from coingecko import CoinGeckoClient
 from binance_client import BinanceClient
 from liquidations import LiquidationTracker
 from netflow import EtherscanNetflow, ERC20_CONTRACTS
-from confluence import ConfluenceEngine
+from confluence import ConfluenceEngine, Signal
 from detectors_v2 import (
     VolumeSpikeDetector, PriceMoveATRDetector, BreakoutDetector,
     OpenInterestDetector, FundingRateDetector, LiquidationsDetector,
@@ -79,7 +79,7 @@ def _defaults(c):
                 "min_detector_count": {"watch":1,"signal":2,"strong":3},
             },
             "radar": {
-                "enabled": True, "top_n_coins": 500,
+                "enabled": True, "top_n_coins": 1500,
                 "min_market_cap_usd": 5000000, "max_market_cap_usd": 200000000,
                 "min_volume_24h_usd": 1000000, "min_age_days": 7,
                 "detectors_enabled": ["volume_spike","price_move_atr","breakout"],
@@ -398,14 +398,25 @@ class AlertBotV2:
                                 a.coin, len(klines) if klines else 0)
 
     def _process_coin_radar(self, coin_data):
-        """Облегчённая обработка для radar stream — только vol/price/breakout."""
+        """Облегчённая обработка для radar — без persistent state (экономия RAM)."""
         sym = coin_data["symbol"].upper()
         pair = self.binance.make_pair(sym)
         if pair not in self.binance.spot_symbols(): return
         kl = self.binance.klines(pair, "1h", 200)
         if not kl or len(kl) < 24: return
-        # Только три базовых детектора
-        if s := self.det_volume.update(sym, kl): self._add_signal_safe(s)
+        # Простая проверка объёма: текущий час vs среднее 24ч (без baseline в памяти)
+        avg_vol = sum(k["quote_volume"] for k in kl[-25:-1]) / 24
+        if avg_vol > 0:
+            mult = kl[-1]["quote_volume"] / avg_vol
+            if mult >= 10:
+                w = self.cfg["detectors"]["volume_spike"]["tiers"]
+                weight = w["x10"] if mult >= 10 else w["x7"]
+                self._add_signal_safe(Signal(
+                    coin=sym, detector="volume_spike", weight=weight,
+                    direction=None,
+                    label=f"Объём x{mult:.0f} (радар)",
+                    details=f"vs среднее 24ч",
+                ))
         if s := self.det_price.update(sym, kl): self._add_signal_safe(s)
         if s := self.det_breakout.update(sym, kl): self._add_signal_safe(s)
 
@@ -459,6 +470,10 @@ class AlertBotV2:
                     self._perf["last_core_count"] = count
                     log.info("💎 Core: %d монет за %.1fс", count, elapsed)
 
+                # Очищаем кэш klines после core — данные уже обработаны
+                with self.binance._cache_lock:
+                    self.binance._klines_cache.clear()
+
                 # === RADAR STREAM (реже — каждые radar_interval сек) ===
                 radar_due = (time.time() - self._last_radar_scan) >= radar_interval
                 if self._radar_universe and radar_due:
@@ -469,6 +484,9 @@ class AlertBotV2:
                     self._perf["last_radar_count"] = count
                     self._last_radar_scan = time.time()
                     log.info("🔭 Radar: %d монет за %.1fс", count, elapsed)
+                    # Очищаем кэш klines после radar
+                    with self.binance._cache_lock:
+                        self.binance._klines_cache.clear()
 
                 self._dispatch_alerts()
                 self._cleanup_memory()
